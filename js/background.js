@@ -181,6 +181,7 @@
         const user = {
           regionCode: window.storage.get('regionCode'),
           ourNumber: textsecure.storage.user.getNumber(),
+          isSecondaryDevice: !!textsecure.storage.get('isSecondaryDevice'),
         };
         Whisper.events.trigger('userChanged', user);
 
@@ -586,7 +587,10 @@
     if (Whisper.Import.isIncomplete()) {
       window.log.info('Import was interrupted, showing import error screen');
       appView.openImporter();
-    } else if (Whisper.Registration.everDone()) {
+    } else if (
+      Whisper.Registration.everDone() &&
+      !Whisper.Registration.ongoingSecondaryDeviceRegistration()
+    ) {
       // listeners
       Whisper.RotateSignedPreKeyListener.init(Whisper.events, newVersion);
       // window.Signal.RefreshSenderCertificate.initialize({
@@ -711,6 +715,12 @@
       }
     });
 
+    Whisper.events.on('showDevicePairingDialog', async () => {
+      if (appView) {
+        appView.showDevicePairingDialog();
+      }
+    });
+
     Whisper.events.on('calculatingPoW', ({ pubKey, timestamp }) => {
       try {
         const conversation = ConversationController.get(pubKey);
@@ -732,6 +742,15 @@
     Whisper.events.on('password-updated', () => {
       if (appView && appView.inboxView) {
         appView.inboxView.trigger('password-updated');
+      }
+    });
+
+    Whisper.events.on('devicePairingRequestAccepted', async (pubKey, cb) => {
+      try {
+        await getAccountManager().authoriseSecondaryDevice(pubKey);
+        cb(null);
+      } catch (e) {
+        cb(e);
       }
     });
   }
@@ -1015,7 +1034,7 @@
     ev.confirm();
   }
 
-  function onTyping(ev) {
+  async function onTyping(ev) {
     const { typing, sender, senderDevice } = ev;
     const { groupId, started } = typing || {};
 
@@ -1024,7 +1043,17 @@
       return;
     }
 
-    const conversation = ConversationController.get(groupId || sender);
+    let primaryDevice = null;
+    const authorisation = await window.libloki.storage.getGrantAuthorisationForSecondaryPubKey(
+      sender
+    );
+    if (authorisation) {
+      primaryDevice = authorisation.primaryDevicePubKey;
+    }
+
+    const conversation = ConversationController.get(
+      groupId || primaryDevice || sender
+    );
 
     if (conversation) {
       conversation.notifyTyping({
@@ -1250,6 +1279,14 @@
       if (isDuplicate) {
         window.log.warn('Received duplicate message', message.idForLogging());
         return event.confirm();
+      }
+
+      // Funnel messages to primary device conversation if multi-device
+      const authorisation = await window.libloki.storage.getGrantAuthorisationForSecondaryPubKey(
+        messageDescriptor.id
+      );
+      if (authorisation) {
+        messageDescriptor.id = authorisation.primaryDevicePubKey;
       }
 
       await ConversationController.getOrCreateAndWait(
